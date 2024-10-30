@@ -170,11 +170,14 @@ def categorize(transactions: list[dict]):
         else:
             credit += amount
     fns = ", ".join(sorted(fns))
-    print(tabulate(d, headers=["Category", "amount", "count"], numalign="left"))
-    print(f"Debit: {debit}, credit: {credit}, files: {fns}")
+    print(tabulate(d, headers=["Category", "Amount", "Count"], numalign="left"))
+    print()
+    print(tabulate([[debit, credit, fns]], headers=["Debit", "Credit", "Files"], numalign="left"))
     b1 = _currency(transactions[0]['balance'])
     b2 = _currency(transactions[-1]['balance'])
-    print(f"Balance: {b1} -> {b2}")
+
+    print()
+    print(tabulate([[b1, b2]], headers=["Balance start", "End"], numalign="left"))
 
 
 transactions = []
@@ -187,5 +190,7 @@ transactions.sort(key=lambda x: x["purchase_date"].strftime("%Y%m"))
 
 for month, trxs in groupby(transactions, lambda x: x["purchase_date"].strftime("%Y-%m")):
     print()
+    print("=======")
     print(month)
+    print("=======")
     categorize(list(trxs))
