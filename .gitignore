@@ -2,3 +2,4 @@
 *.db
 *.log
 *.pdf
+__pycache__/*
