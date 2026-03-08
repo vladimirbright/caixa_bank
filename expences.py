@@ -1,17 +1,12 @@
-import argparse
 import glob
 import os
 import re
-import sys
 from datetime import date
 from decimal import Decimal
-from pprint import pp
 from collections import defaultdict, Counter
 from itertools import groupby
 
-import babel.numbers
 import fitz  # PyMuPDF
-from tabulate import tabulate
 
 
 CATEGORIES = {
@@ -432,6 +427,7 @@ SUPER_CATEGORIES = {
 
 
 def _currency(v: Decimal) -> str:
+    import babel.numbers
     return babel.numbers.format_currency(v, 'EUR', locale='en_CA')
 
 
@@ -475,101 +471,191 @@ def extract_transactions(pdf_path):
     return transactions
 
 
-def categorize_transaction(description, amount):
-    """Return the category for a single transaction."""
+def compute_recurring_amounts(all_transactions):
+    """Find subscription amounts that appear at least twice (recurring charges).
+
+    Returns a set of amounts that recur, used to distinguish real subscriptions
+    from one-off purchases at subscription vendors (e.g. Apple Store buys).
+    """
+    amount_counts = Counter()
+    for trx in all_transactions:
+        cat = _raw_categorize(trx["description"], trx["amount"])
+        if cat == "Subscriptions":
+            amount_counts[trx["amount"]] += 1
+    return {amt for amt, cnt in amount_counts.items() if cnt >= 2}
+
+
+def _raw_categorize(description, amount):
+    """Return the raw category from CATEGORIES dict (no recurring check)."""
     desc_upper = description.upper()
     for pattern, category in CATEGORIES.items():
         if pattern.upper() in desc_upper:
             if category == "Uber" and amount < Decimal("-15"):
                 return "Uber Eats"
+            if category == "Transfers" and Decimal("-1500") <= amount <= Decimal("-1400"):
+                return "Rent"
             return category
     return None
 
 
-def categorize(transactions: list[dict]):
-    """Categorize and print a monthly summary. Returns (sums, counts, uncategorized)."""
+def categorize_transaction(description, amount, recurring_amounts=None):
+    """Return the category for a single transaction.
+
+    If recurring_amounts is provided, transactions that match a Subscriptions
+    pattern but whose amount does not recur are reclassified as Shopping.
+    """
+    cat = _raw_categorize(description, amount)
+    if cat == "Subscriptions" and recurring_amounts is not None:
+        if amount not in recurring_amounts:
+            return "Shopping"
+    return cat
+
+
+def categorize(transactions: list[dict], recurring_amounts=None) -> dict:
+    """Categorize transactions and return structured data.
+
+    Returns dict with keys: sums, counts, uncategorized, debit, credit,
+    balance_start, balance_end, categorized_transactions.
+    """
     sums = Counter()
     counts = defaultdict(int)
     uncategorized = []
+    categorized_transactions = []
 
     for trx in transactions:
-        cat = categorize_transaction(trx["description"], trx["amount"])
+        cat = categorize_transaction(trx["description"], trx["amount"], recurring_amounts)
         if cat:
             sums[cat] += trx["amount"]
             counts[cat] += 1
+            categorized_transactions.append({**trx, "category": cat})
         else:
-            uncategorized.append(trx)
+            uncategorized.append({**trx, "category": None})
 
     debit = Decimal()
     credit = Decimal()
-
-    d = []
-    for c, amount in sorted(sums.items(), key=lambda x: (x[1] < Decimal(), -abs(x[1]))):
-        d.append((c, _currency(amount), counts[c]))
+    for amount in sums.values():
         if amount < Decimal():
             debit += amount
         else:
             credit += amount
 
-    print(tabulate(d, headers=["Category", "Amount", "Count"], numalign="left"))
-    print()
-    print(tabulate(
-        [[_currency(debit), _currency(credit), _currency(credit + debit)]],
-        headers=["Spending", "Income", "Net"],
-        numalign="left",
-    ))
+    balance_start = transactions[0]["balance"] if transactions else None
+    balance_end = transactions[-1]["balance"] if transactions else None
 
-    if transactions:
-        b1 = _currency(transactions[0]['balance'])
-        b2 = _currency(transactions[-1]['balance'])
-        print()
-        print(tabulate([[b1, b2]], headers=["Balance start", "End"], numalign="left"))
-
-    if uncategorized:
-        print(f"\n  [{len(uncategorized)} uncategorized transaction(s)]")
-        for trx in uncategorized:
-            print(f"    {trx['purchase_date']}  {_currency(trx['amount']):>12}  {trx['description']}")
-
-    return sums, counts, uncategorized
+    return {
+        "sums": dict(sums),
+        "counts": dict(counts),
+        "uncategorized": uncategorized,
+        "categorized_transactions": categorized_transactions,
+        "debit": debit,
+        "credit": credit,
+        "balance_start": balance_start,
+        "balance_end": balance_end,
+    }
 
 
-def print_overall_summary(all_monthly_sums, months_count, all_transactions):
-    """Print an overall summary across all months with financial recommendations."""
-    print("\n")
-    print("=" * 60)
-    print("OVERALL SUMMARY")
-    print("=" * 60)
+def load_transactions(directory=".", last_n_months=0):
+    """Load and sort all transactions, optionally limited to last N months.
 
-    # Aggregate across all months
+    Returns (monthly_groups, all_transactions, recurring_amounts) where
+    monthly_groups is a list of (month_str, [transactions]) tuples and
+    recurring_amounts is the set of subscription amounts that recur.
+    """
+    pdf_files = discover_pdfs(directory)
+    if not pdf_files:
+        return [], [], set()
+
+    all_transactions = []
+    for pdf in pdf_files:
+        all_transactions += extract_transactions(pdf)
+
+    all_transactions.sort(key=lambda x: (x["purchase_date"], x["transaction_date"]))
+
+    # Compute recurring amounts from ALL transactions before slicing
+    recurring_amounts = compute_recurring_amounts(all_transactions)
+
+    monthly_groups = []
+    for month, trxs in groupby(all_transactions, lambda x: x["purchase_date"].strftime("%Y-%m")):
+        monthly_groups.append((month, list(trxs)))
+
+    if last_n_months:
+        monthly_groups = monthly_groups[-last_n_months:]
+        all_transactions = [trx for _, trxs in monthly_groups for trx in trxs]
+
+    return monthly_groups, all_transactions, recurring_amounts
+
+
+def compute_monthly_stats(monthly_groups: list[tuple[str, list[dict]]], recurring_amounts=None) -> list[dict]:
+    """Compute per-month statistics.
+
+    Returns list of dicts with keys: month, income, spending, net, savings_rate,
+    balance_start, balance_end, category_data (from categorize()).
+    """
+    results = []
+    for month, trx_list in monthly_groups:
+        cat_data = categorize(trx_list, recurring_amounts)
+        income = cat_data["credit"]
+        spending = cat_data["debit"]
+        net = income + spending
+        savings_rate = (net / income * 100) if income > 0 else Decimal(0)
+
+        results.append({
+            "month": month,
+            "income": income,
+            "spending": spending,
+            "net": net,
+            "savings_rate": savings_rate,
+            "balance_start": cat_data["balance_start"],
+            "balance_end": cat_data["balance_end"],
+            "category_data": cat_data,
+        })
+    return results
+
+
+def compute_overall_stats(monthly_stats: list[dict], all_transactions: list[dict],
+                          recurring_amounts=None) -> dict:
+    """Compute aggregated statistics across all months.
+
+    Returns dict with keys: months_count, total_income, total_spending, total_net,
+    savings_rate, balance_start, balance_end, balance_change,
+    categories (list of dicts), super_categories (list of dicts),
+    monthly_trend (list of dicts), recommendations (list of strings),
+    total_transactions, uncategorized (list of transactions).
+    """
+    months_count = len(monthly_stats)
+    if not months_count:
+        return {}
+
+    # Aggregate category sums and counts
     total_sums = Counter()
     total_counts = defaultdict(int)
-    for sums, counts in all_monthly_sums:
-        for cat, amount in sums.items():
+    all_uncategorized = []
+
+    for ms in monthly_stats:
+        cd = ms["category_data"]
+        for cat, amount in cd["sums"].items():
             total_sums[cat] += amount
-            total_counts[cat] += counts[cat]
+            total_counts[cat] += cd["counts"].get(cat, 0)
+        all_uncategorized.extend(cd["uncategorized"])
 
-    total_debit = Decimal()
-    total_credit = Decimal()
-
-    d = []
-    for c, amount in sorted(total_sums.items(), key=lambda x: (x[1] < Decimal(), -abs(x[1]))):
+    total_income = Decimal()
+    total_spending = Decimal()
+    categories = []
+    for cat, amount in sorted(total_sums.items(), key=lambda x: (x[1] < Decimal(), -abs(x[1]))):
         avg = amount / months_count
-        d.append((c, _currency(amount), total_counts[c], _currency(avg)))
+        categories.append({
+            "category": cat,
+            "total": amount,
+            "count": total_counts[cat],
+            "monthly_avg": avg,
+        })
         if amount < Decimal():
-            total_debit += amount
+            total_spending += amount
         else:
-            total_credit += amount
+            total_income += amount
 
-    print(f"\nPeriod: {months_count} month(s)")
-    print(f"Total transactions: {sum(total_counts.values())}\n")
-
-    print(tabulate(d, headers=["Category", "Total", "Count", "Monthly avg"], numalign="left"))
-    print()
-    print(tabulate(
-        [[_currency(total_debit), _currency(total_credit), _currency(total_credit + total_debit)]],
-        headers=["Total spending", "Total income", "Net"],
-        numalign="left",
-    ))
+    total_net = total_income + total_spending
+    savings_rate = (total_net / total_income * 100) if total_income > 0 else Decimal(0)
 
     # Super-category breakdown
     super_sums = defaultdict(Decimal)
@@ -578,62 +664,79 @@ def print_overall_summary(all_monthly_sums, months_count, all_transactions):
         super_sums[sc] += amount
 
     spending_super = {k: v for k, v in super_sums.items() if v < Decimal() and k not in ("Income", "Transfers")}
-    if spending_super:
-        print("\n--- Spending by group ---\n")
-        sd = []
-        total_spending = sum(spending_super.values())
-        for sc, amount in sorted(spending_super.items(), key=lambda x: x[1]):
-            pct = (amount / total_spending * 100) if total_spending else Decimal()
-            sd.append((sc, _currency(amount), _currency(amount / months_count), f"{pct:.1f}%"))
-        print(tabulate(sd, headers=["Group", "Total", "Monthly avg", "% of spending"], numalign="left"))
+    super_total = sum(spending_super.values()) if spending_super else Decimal()
+    super_categories = []
+    for sc, amount in sorted(spending_super.items(), key=lambda x: x[1]):
+        pct = (amount / super_total * 100) if super_total else Decimal()
+        super_categories.append({
+            "group": sc,
+            "total": amount,
+            "monthly_avg": amount / months_count,
+            "pct": pct,
+        })
 
     # Balance trend
-    if all_transactions:
-        first_balance = all_transactions[0]["balance"]
-        last_balance = all_transactions[-1]["balance"]
-        balance_change = last_balance - first_balance
-        print(f"\n--- Balance trend ---\n")
-        print(f"  Start:  {_currency(first_balance)}")
-        print(f"  End:    {_currency(last_balance)}")
-        print(f"  Change: {_currency(balance_change)}")
+    balance_start = all_transactions[0]["balance"] if all_transactions else None
+    balance_end = all_transactions[-1]["balance"] if all_transactions else None
+    balance_change = (balance_end - balance_start) if balance_start is not None else None
 
-    # Monthly spending trend
-    print(f"\n--- Monthly spending trend ---\n")
+    # Monthly spending/income trend
     monthly_spending = defaultdict(Decimal)
-    monthly_income = defaultdict(Decimal)
+    monthly_income_map = defaultdict(Decimal)
     for trx in all_transactions:
         month_key = trx["purchase_date"].strftime("%Y-%m")
         if trx["amount"] < Decimal():
-            cat = categorize_transaction(trx["description"], trx["amount"])
+            cat = categorize_transaction(trx["description"], trx["amount"], recurring_amounts)
             if cat != "Transfers":
                 monthly_spending[month_key] += trx["amount"]
         else:
-            monthly_income[month_key] += trx["amount"]
+            monthly_income_map[month_key] += trx["amount"]
 
-    trend_data = []
-    for month in sorted(set(monthly_spending) | set(monthly_income)):
+    monthly_trend = []
+    for month in sorted(set(monthly_spending) | set(monthly_income_map)):
         spent = monthly_spending.get(month, Decimal())
-        income = monthly_income.get(month, Decimal())
+        income = monthly_income_map.get(month, Decimal())
         savings = income + spent
         rate = (savings / income * 100) if income else Decimal()
-        trend_data.append((month, _currency(income), _currency(spent), _currency(savings), f"{rate:.0f}%"))
-    print(tabulate(trend_data, headers=["Month", "Income", "Spending", "Savings", "Rate"], numalign="left"))
+        monthly_trend.append({
+            "month": month,
+            "income": income,
+            "spending": spent,
+            "savings": savings,
+            "savings_rate": rate,
+        })
 
-    # Financial recommendations
-    print_recommendations(total_sums, total_counts, months_count, monthly_spending, monthly_income)
+    # Recommendations
+    recommendations = _compute_recommendations(
+        total_sums, total_counts, months_count,
+        monthly_spending, monthly_income_map, all_transactions,
+    )
+
+    return {
+        "months_count": months_count,
+        "total_income": total_income,
+        "total_spending": total_spending,
+        "total_net": total_net,
+        "savings_rate": savings_rate,
+        "balance_start": balance_start,
+        "balance_end": balance_end,
+        "balance_change": balance_change,
+        "categories": categories,
+        "super_categories": super_categories,
+        "monthly_trend": monthly_trend,
+        "recommendations": recommendations,
+        "total_transactions": sum(total_counts.values()),
+        "uncategorized": all_uncategorized,
+    }
 
 
-def print_recommendations(total_sums, total_counts, months_count, monthly_spending, monthly_income):
+def _compute_recommendations(total_sums, total_counts, months_count,
+                             monthly_spending, monthly_income, all_transactions):
     """Generate financial recommendations based on spending patterns."""
-    print("\n" + "=" * 60)
-    print("FINANCIAL RECOMMENDATIONS")
-    print("=" * 60)
-
     recommendations = []
     avg_monthly_income = sum(monthly_income.values()) / months_count if months_count else Decimal()
     avg_monthly_spending = abs(sum(monthly_spending.values()) / months_count) if months_count else Decimal()
 
-    # Savings rate
     if avg_monthly_income > 0:
         savings_rate = (avg_monthly_income - avg_monthly_spending) / avg_monthly_income * 100
         if savings_rate < 20:
@@ -647,7 +750,6 @@ def print_recommendations(total_sums, total_counts, months_count, monthly_spendi
                 f"Consider investing surplus in index funds or savings certificates (Certificados de Aforro)."
             )
 
-    # Uber / ride-hailing analysis
     uber_total = abs(total_sums.get("Uber", Decimal()) + total_sums.get("Bolt", Decimal()))
     uber_avg = uber_total / months_count if months_count else Decimal()
     if uber_avg > Decimal("100"):
@@ -656,7 +758,6 @@ def print_recommendations(total_sums, total_counts, months_count, monthly_spendi
             f"A monthly transit pass (Navegante) costs ~EUR 40 and covers all Lisbon transit."
         )
 
-    # Uber Eats
     eats_total = abs(total_sums.get("Uber Eats", Decimal()))
     eats_avg = eats_total / months_count if months_count else Decimal()
     if eats_avg > Decimal("50"):
@@ -665,7 +766,6 @@ def print_recommendations(total_sums, total_counts, months_count, monthly_spendi
             f"Cooking at home or meal prepping could cut this significantly."
         )
 
-    # Dining out (cafe + restaurant)
     dining = abs(total_sums.get("Cafe", Decimal()) + total_sums.get("Restaurant", Decimal()))
     dining_avg = dining / months_count if months_count else Decimal()
     if dining_avg > Decimal("100"):
@@ -673,7 +773,6 @@ def print_recommendations(total_sums, total_counts, months_count, monthly_spendi
             f"[-] DINING OUT: Averaging {_currency(dining_avg)}/month on cafes and restaurants."
         )
 
-    # Groceries
     grocery_total = abs(total_sums.get("Groceries", Decimal()))
     grocery_avg = grocery_total / months_count if months_count else Decimal()
     if grocery_avg > Decimal("300"):
@@ -682,7 +781,6 @@ def print_recommendations(total_sums, total_counts, months_count, monthly_spendi
             f"Consider shopping more at Lidl/Pingo Doce vs Continente for savings."
         )
 
-    # Subscriptions
     subs_total = abs(total_sums.get("Subscriptions", Decimal()) + total_sums.get("Games", Decimal()))
     subs_avg = subs_total / months_count if months_count else Decimal()
     if subs_avg > Decimal("30"):
@@ -691,7 +789,6 @@ def print_recommendations(total_sums, total_counts, months_count, monthly_spendi
             f"Review if all are actively used."
         )
 
-    # Bank fees
     fees_total = abs(total_sums.get("Bank fees", Decimal()))
     fees_avg = fees_total / months_count if months_count else Decimal()
     if fees_avg > Decimal("0"):
@@ -700,7 +797,6 @@ def print_recommendations(total_sums, total_counts, months_count, monthly_spendi
             f"Consider switching to a free digital bank (Moey, ActivoBank) to eliminate this."
         )
 
-    # Spending volatility
     spending_values = [abs(v) for v in monthly_spending.values()]
     if len(spending_values) >= 3:
         avg_spend = sum(spending_values) / len(spending_values)
@@ -712,7 +808,6 @@ def print_recommendations(total_sums, total_counts, months_count, monthly_spendi
                 f"(avg: {_currency(avg_spend)}). Check for large one-off purchases."
             )
 
-    # Travel
     travel_total = abs(total_sums.get("Travel", Decimal()))
     if travel_total > Decimal("0"):
         recommendations.append(
@@ -720,9 +815,8 @@ def print_recommendations(total_sums, total_counts, months_count, monthly_spendi
             f"Book flights in advance and use price trackers for better deals."
         )
 
-    # Emergency fund check
-    if avg_monthly_spending > 0:
-        months_covered = all_transactions[-1]["balance"] / avg_monthly_spending if all_transactions else Decimal()
+    if avg_monthly_spending > 0 and all_transactions:
+        months_covered = all_transactions[-1]["balance"] / avg_monthly_spending
         if months_covered < 6:
             recommendations.append(
                 f"[!] EMERGENCY FUND: Current balance covers ~{months_covered:.1f} months of expenses. "
@@ -734,54 +828,113 @@ def print_recommendations(total_sums, total_counts, months_count, monthly_spendi
                 f"Well above the recommended 6-month buffer."
             )
 
-    print()
-    for i, rec in enumerate(recommendations, 1):
-        print(f"  {i}. {rec}")
+    return recommendations
+
+
+def main():
+    """CLI entry point — prints reports to stdout (legacy behavior)."""
+    import argparse
+    import sys
+    from tabulate import tabulate
+
+    parser = argparse.ArgumentParser(description="Analyse bank statement PDFs")
+    parser.add_argument("directory", nargs="?", default=".", help="Directory containing PDF statements")
+    parser.add_argument("-n", "--months", type=int, default=0, help="Only show the last N months")
+    args = parser.parse_args()
+
+    monthly_groups, all_transactions, recurring_amounts = load_transactions(args.directory, args.months)
+
+    if not monthly_groups:
+        print(f"No PDF files found in {os.path.abspath(args.directory)}")
+        sys.exit(1)
+
+    pdf_files = discover_pdfs(args.directory)
+    print(f"Found {len(pdf_files)} statement(s): {', '.join(os.path.basename(f) for f in pdf_files)}\n")
+
+    monthly_stats = compute_monthly_stats(monthly_groups, recurring_amounts)
+
+    for ms in monthly_stats:
+        cd = ms["category_data"]
         print()
+        print("=" * 40)
+        print(f"  {ms['month']}")
+        print("=" * 40)
+
+        d = []
+        for c, amount in sorted(cd["sums"].items(), key=lambda x: (x[1] < Decimal(), -abs(x[1]))):
+            d.append((c, _currency(amount), cd["counts"][c]))
+        print(tabulate(d, headers=["Category", "Amount", "Count"], numalign="left"))
+        print()
+        print(tabulate(
+            [[_currency(cd["debit"]), _currency(cd["credit"]), _currency(cd["credit"] + cd["debit"])]],
+            headers=["Spending", "Income", "Net"],
+            numalign="left",
+        ))
+
+        if cd["balance_start"] is not None:
+            print()
+            print(tabulate(
+                [[_currency(cd["balance_start"]), _currency(cd["balance_end"])]],
+                headers=["Balance start", "End"],
+                numalign="left",
+            ))
+
+        if cd["uncategorized"]:
+            print(f"\n  [{len(cd['uncategorized'])} uncategorized transaction(s)]")
+            for trx in cd["uncategorized"]:
+                print(f"    {trx['purchase_date']}  {_currency(trx['amount']):>12}  {trx['description']}")
+
+    if len(monthly_stats) > 1:
+        overall = compute_overall_stats(monthly_stats, all_transactions, recurring_amounts)
+        print("\n")
+        print("=" * 60)
+        print("OVERALL SUMMARY")
+        print("=" * 60)
+        print(f"\nPeriod: {overall['months_count']} month(s)")
+        print(f"Total transactions: {overall['total_transactions']}\n")
+
+        d = []
+        for cat_info in overall["categories"]:
+            d.append((cat_info["category"], _currency(cat_info["total"]),
+                       cat_info["count"], _currency(cat_info["monthly_avg"])))
+        print(tabulate(d, headers=["Category", "Total", "Count", "Monthly avg"], numalign="left"))
+        print()
+        print(tabulate(
+            [[_currency(overall["total_spending"]), _currency(overall["total_income"]),
+              _currency(overall["total_net"])]],
+            headers=["Total spending", "Total income", "Net"],
+            numalign="left",
+        ))
+
+        if overall["super_categories"]:
+            print("\n--- Spending by group ---\n")
+            sd = []
+            for sc in overall["super_categories"]:
+                sd.append((sc["group"], _currency(sc["total"]),
+                           _currency(sc["monthly_avg"]), f"{sc['pct']:.1f}%"))
+            print(tabulate(sd, headers=["Group", "Total", "Monthly avg", "% of spending"], numalign="left"))
+
+        if overall["balance_start"] is not None:
+            print(f"\n--- Balance trend ---\n")
+            print(f"  Start:  {_currency(overall['balance_start'])}")
+            print(f"  End:    {_currency(overall['balance_end'])}")
+            print(f"  Change: {_currency(overall['balance_change'])}")
+
+        print(f"\n--- Monthly spending trend ---\n")
+        td = []
+        for mt in overall["monthly_trend"]:
+            td.append((mt["month"], _currency(mt["income"]), _currency(mt["spending"]),
+                        _currency(mt["savings"]), f"{mt['savings_rate']:.0f}%"))
+        print(tabulate(td, headers=["Month", "Income", "Spending", "Savings", "Rate"], numalign="left"))
+
+        print("\n" + "=" * 60)
+        print("FINANCIAL RECOMMENDATIONS")
+        print("=" * 60)
+        print()
+        for i, rec in enumerate(overall["recommendations"], 1):
+            print(f"  {i}. {rec}")
+            print()
 
 
-# --- Main ---
-
-parser = argparse.ArgumentParser(description="Analyse bank statement PDFs")
-parser.add_argument("directory", nargs="?", default=".", help="Directory containing PDF statements")
-parser.add_argument("-n", "--months", type=int, default=0, help="Only show the last N months")
-args = parser.parse_args()
-
-pdf_files = discover_pdfs(args.directory)
-
-if not pdf_files:
-    print(f"No comprovativo_*.pdf files found in {os.path.abspath(args.directory)}")
-    sys.exit(1)
-
-print(f"Found {len(pdf_files)} statement(s): {', '.join(os.path.basename(f) for f in pdf_files)}\n")
-
-all_transactions = []
-for pdf in pdf_files:
-    all_transactions += extract_transactions(pdf)
-
-all_transactions.sort(key=lambda x: (x["purchase_date"], x["transaction_date"]))
-
-# Group by month, then optionally slice to last N
-monthly_groups = []
-for month, trxs in groupby(all_transactions, lambda x: x["purchase_date"].strftime("%Y-%m")):
-    monthly_groups.append((month, list(trxs)))
-
-if args.months:
-    monthly_groups = monthly_groups[-args.months:]
-    all_transactions = [trx for _, trxs in monthly_groups for trx in trxs]
-
-# Monthly breakdowns
-all_monthly_sums = []
-months = []
-for month, trx_list in monthly_groups:
-    months.append(month)
-    print()
-    print("=" * 40)
-    print(f"  {month}")
-    print("=" * 40)
-    sums, counts, _ = categorize(trx_list)
-    all_monthly_sums.append((sums, counts))
-
-# Overall summary with recommendations
-if len(months) > 1:
-    print_overall_summary(all_monthly_sums, len(months), all_transactions)
+if __name__ == "__main__":
+    main()

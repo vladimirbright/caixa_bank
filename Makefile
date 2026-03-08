@@ -1,4 +1,7 @@
 N ?=
 
 run:
-	uv run expences.py $(if $(N),-n $(N))
+	uv run python tui.py $(if $(N),-n $(N))
+
+cli:
+	uv run python expences.py $(if $(N),-n $(N))
